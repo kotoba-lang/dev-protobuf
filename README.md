@@ -65,17 +65,57 @@ directions agree about exactly which values exist. The guard runs *before* the
 multiplier advances — 128^9 is exactly `Long/MAX_VALUE + 1`, so checking
 afterwards would overflow before it refused.
 
-**Values are host integers**: exact to 2^64 on the JVM, to 2^53 on
-ClojureScript (`max-exact` names the edge). IPNS sequence numbers, TTLs in
-nanoseconds and Kademlia cluster levels are all far inside it.
+**Values above 2^53-1 are refused, on both hosts.** Varints and fixed fields
+alike, in both directions.
+
+This paragraph used to say the opposite — that values are host integers, exact
+to 2^64 on the JVM and 2^53 on ClojureScript, and that "IPNS sequence numbers,
+TTLs in nanoseconds and Kademlia cluster levels are all far inside it."
+Measured 2026-08-17, both halves were wrong. The edge was enforced nowhere:
+
+```
+octets for 2^53+1  ->  JVM 9007199254740993    CLJS 9007199254740992
+octets for 2^63-1  ->  JVM 9223372036854775807 CLJS 9223372036854776000
+```
+
+returned as ordinary values with no error, so the same octets were two
+different numbers depending on where they were read. And the example given as
+safely inside the range is the one that is not: **an IPNS TTL is in
+nanoseconds, and 2^53 ns is 104 days.** A record with a one-year TTL is an
+ordinary record.
+
+So the edge is enforced now, for the same reason negatives are refused: a
+value one host accepts and the other silently corrupts is worse than a value
+neither accepts. A caller who genuinely needs the top eleven bits of a uint64
+should read the field's raw octets — growing a big-integer path here is a
+decision with a cost, not an oversight.
+
+`fixed64` was broken outright on ClojureScript in both directions:
+`bit-shift-right` operates on int32 there **and** takes its shift count modulo
+32, so encoding emitted the low four octets twice and decoding added them
+twice. That path is arithmetic now. `fixed32` had the same shape — a top octet
+of `0xFF` decoded negative.
 
 **Groups (wire types 3 and 4) are absent.** They were deprecated by proto2
 itself.
 
 ## Test
 
+**Both runtimes, every time.**
+
 ```
-clojure -M:test
+clojure -M:test                                    # JVM
+npx nbb --classpath src:test test/run.cljs         # ClojureScript
 ```
 
-15 tests / 58 assertions, including the spec's own varint examples.
+18 tests / 66 assertions, identical on both, including the spec's own varint
+examples.
+
+Running only the JVM is what let the three defects above sit in the green for
+months: this library's callers (`tech-ipfs-specs-ipns`,
+`io-libp2p-specs-kad-dht`) run in Workers and browsers, so ClojureScript is
+the runtime it actually ships to, and it was the one nothing ran. Two of the
+assertions were host-dependent in the test itself — `(dec (bit-shift-left 1
+31))` is 2^31-1 on the JVM and -2147483649 on ClojureScript, and `(int \A)`
+is 65 on the JVM and 0 on ClojureScript — so they compared different things
+on the two hosts and passed on both.
