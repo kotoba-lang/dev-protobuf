@@ -11,7 +11,11 @@
   (is (= [0xFF 0x01] (pb/encode-varint 255)))
   (is (= [0xAC 0x02] (pb/encode-varint 300)))
   (testing "and decode is its inverse"
-    (doseq [n [0 1 127 128 150 255 300 16383 16384 2097151 (dec (bit-shift-left 1 31))]]
+    ;; 2147483647 as a literal, not `(dec (bit-shift-left 1 31))`: that shift
+    ;; is int32 on ClojureScript, where it evaluates to -2147483649 and the
+    ;; case silently became "does the encoder refuse a negative" on one host
+    ;; and "does it handle 2^31-1" on the other.
+    (doseq [n [0 1 127 128 150 255 300 16383 16384 2097151 2147483647]]
       (is (= [n (count (pb/encode-varint n))]
              (pb/decode-varint (pb/encode-varint n) 0))
           (str n)))))
@@ -23,6 +27,55 @@
   (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                (pb/decode-varint (vec (repeat 12 0x80)) 0))
       "nine groups is the limit, and the guard runs before the multiplier grows"))
+
+;; ── the exactness edge, written as OCTETS ────────────────────────────────────
+;;
+;; Deliberately not numeric literals. On ClojureScript the reader itself rounds
+;; an integer literal past 2^53, so `(pb/decode-varint (pb/encode-varint N) 0)`
+;; cannot express these cases: the N in the source is already a different
+;; number before any code runs. The first attempt at this test was written that
+;; way and passed on both hosts while the bug was still there.
+
+(def ^:private past-the-edge
+  "Octets for values above `max-exact`, computed on a host with exact 64-bit
+  integers and pasted here."
+  {"2^53+1"  [129 128 128 128 128 128 128 16]
+   "2^54+1"  [129 128 128 128 128 128 128 32]
+   "2^63-1"  [255 255 255 255 255 255 255 255 127]})
+
+(deftest a-varint-past-the-exact-range-is-refused-on-both-hosts
+  ;; Measured 2026-08-17, before this guard existed: these octets decoded to
+  ;; 9007199254740992, 18014398509481984 and 9223372036854776000 on
+  ;; ClojureScript -- returned as ordinary values, no error -- while the JVM
+  ;; returned all three exactly. The same octets, two different numbers,
+  ;; nothing to notice it by.
+  (doseq [[label bs] past-the-edge]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (pb/decode-varint bs 0))
+        label))
+  (testing "and the largest exact value still decodes, on both"
+    (is (= [pb/max-exact 8] (pb/decode-varint [255 255 255 255 255 255 255 15] 0)))))
+
+(deftest encoding-past-the-exact-range-is-refused-rather-than-emitted
+  ;; `quot` and `mod` do not complain about an inexact double, so the octets
+  ;; would be the octets of a different number and the caller would have no
+  ;; way to know. Refused for the reason negatives are refused.
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (pb/encode-varint (inc pb/max-exact))))
+  (is (= 8 (count (pb/encode-varint pb/max-exact)))))
+
+(deftest an-ipns-ttl-beyond-104-days-is-refused-not-corrupted
+  ;; The concrete case that made this a defect rather than a range note. IPNS
+  ;; TTLs are in NANOSECONDS and 2^53 ns is 104.25 days, so a record with a
+  ;; one-year TTL is an ordinary record whose ttl field used to come back as a
+  ;; silently wrong number in a browser and a correct one on the JVM.
+  (let [schema {6 {:name :ttl :type :uint64}}
+        one-year-ns [0x80 0x80 0x8C 0xED 0xB2 0xBA 0x82 0x38]]  ; 31,536,000,000,000,000 = 365 days
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (pb/decode schema (into [0x30] one-year-ns)))
+        "field 6, wire type 0")
+    (is (false? (pb/round-trips? schema (into [0x30] one-year-ns)))
+        "and the round-trip predicate reports it rather than throwing")))
 
 (deftest signed-varints-are-refused-symmetrically-rather-than-half-supported
   (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
@@ -133,7 +186,11 @@
   (let [decoded {:name "A" :protobuf/unknown {12 [0 [7]] 9 [2 [1 0]]}}
         bs (pb/encode person decoded)]
     ;; field 1, then 9, then 12 — ascending, interleaved with the known field.
-    (is (= [0x0A 0x01 (int \A) 0x4A 0x01 0x00 0x60 0x07] bs))))
+    ;; 0x41 rather than `(int \A)`: ClojureScript has no character type, so
+    ;; `\A` is the string "A" and `(int "A")` is 0 there -- the assertion
+    ;; compared the encoder's output against zero and passed for the wrong
+    ;; reason on the host this library is deployed to.
+    (is (= [0x0A 0x01 0x41 0x4A 0x01 0x00 0x60 0x07] bs))))
 
 (deftest round-trips-reports-false-rather-than-throwing-on-garbage
   (is (false? (pb/round-trips? person [0x80])))

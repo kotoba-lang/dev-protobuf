@@ -59,17 +59,38 @@
 
 ;; ── varint ────────────────────────────────────────────────────────────────
 
-;; Range note, stated rather than discovered: varints are computed with the
-;; host's ordinary integers. On the JVM that is a 64-bit long and exact for the
-;; whole protobuf range; on ClojureScript it is a double, exact only to 2^53.
-;; The fields this workspace encodes — an IPNS sequence number, a TTL in
-;; nanoseconds, a Kademlia cluster level — stay far inside that, and a library
-;; that reached for BigInt would be non-portable (`bigint` is JVM-only) or
-;; goog.math.Long (CLJS-only) for a range nothing here uses. If a caller ever
-;; needs the top eleven bits of a uint64, this is the place that has to change,
-;; and `max-exact` says where the edge is.
+;; Range note. Varints are computed with the host's ordinary integers: a 64-bit
+;; long on the JVM, exact for the whole protobuf range; a double on
+;; ClojureScript, exact only to 2^53. A library reaching for BigInt would be
+;; non-portable (`bigint` is JVM-only, goog.math.Long is CLJS-only), so the
+;; edge stays where the double is.
+;;
+;; This note used to say the fields here "stay far inside that" and name an
+;; IPNS TTL as an example. **Measured 2026-08-17, that was wrong**, and the
+;; bound it pointed at was enforced nowhere:
+;;
+;;   bytes for 2^53+1   -> JVM 9007199254740993   CLJS 9007199254740992
+;;   bytes for 2^63-1   -> JVM 9223372036854775807 CLJS 9223372036854776000
+;;
+;; Returned as ordinary values, with no error, so the same octets decoded to
+;; different numbers on the two hosts. And the example was the counterexample:
+;; an IPNS TTL is in NANOSECONDS, 2^53 ns is 104 days, and a record with a
+;; one-year TTL is an ordinary record, not a hostile one.
+;;
+;; So the bound is enforced now, in both directions and on both hosts, for the
+;; reason `encode-varint` already gives about negatives: a value one host
+;; accepts and the other silently corrupts is worse than a value neither
+;; accepts. A caller that genuinely needs the top eleven bits of a uint64 must
+;; read the field's raw octets -- this is the place that would have to grow a
+;; big-integer path, and that is a decision with a cost, not an oversight.
 
-(def ^:const max-exact 9007199254740992)        ; 2^53
+(def ^:const max-exact
+  "Largest integer both hosts represent exactly, 2^53-1.
+
+  The same value `proto.wire/max-exact` uses. The two libraries decode the
+  same wire format and MUST agree about which values exist; when this said
+  2^53 and enforced nothing, they disagreed on every value above the edge."
+  9007199254740991)
 
 (defn encode-varint
   "Base-128 varint, little-endian groups, high bit as continuation.
@@ -92,9 +113,20 @@
   `decode-varint` refuses past nine groups for the same reason, so the two
   directions agree about exactly which values exist."
   [n]
-  (if (neg? n)
+  (cond
+    (neg? n)
     (throw (ex-info "negative varints are not supported; declare the field as sint32/sint64 so it is zigzag-encoded"
                     {:value n}))
+
+    ;; Past the edge the arithmetic below is already inexact on ClojureScript,
+    ;; so the octets emitted would be the octets of a DIFFERENT number -- and
+    ;; the caller would have no way to know, because `quot` and `mod` do not
+    ;; complain. Refused rather than emitted for the same reason negatives are.
+    (> n max-exact)
+    (throw (ex-info "varint exceeds the exactly-representable integer range; the octets would encode a different number on ClojureScript"
+                    {:value n :max-exact max-exact}))
+
+    :else
     (loop [v n out []]
       (let [b (mod v 128)
             v' (quot v 128)]
@@ -120,6 +152,12 @@
                       {:at i})))
     (let [b (bit-and (nth bs i) 0xFF)
           acc (+ acc (* mult (bit-and b 0x7F)))]
+      ;; Checked as it accumulates, not at the end: on ClojureScript an `acc`
+      ;; past the edge is already the wrong number, and comparing it is the
+      ;; only thing left that is still reliable about it.
+      (when (> acc max-exact)
+        (throw (ex-info "varint exceeds the exactly-representable integer range; read the field's raw octets if the full uint64 range is needed"
+                        {:at i :max-exact max-exact})))
       (if (zero? (bit-and b 0x80))
         [acc (inc i)]
         ;; 128^9 is exactly Long/MAX+1, so the multiplier must not be advanced
@@ -139,12 +177,57 @@
 
 ;; ── fixed width ───────────────────────────────────────────────────────────
 
+;; Arithmetic, not bit shifts, for the reason the varint path gives: on
+;; ClojureScript `bit-shift-left` / `bit-shift-right` operate on int32 AND take
+;; their shift count modulo 32. Both halves of that bit.
+;;
+;; Measured 2026-08-17, with the shift version: encoding 255 as a `fixed64`
+;; emitted `[255 0 0 0 255 0 0 0]` -- the shifts for bytes 4..7 wrapped to
+;; 0,8,16,24 and re-emitted the low four -- and decoding those octets returned
+;; 510. The JVM, whose shifts are 64-bit, was correct throughout, so a fixed64
+;; written in a Worker and read on the JVM was a different number, silently.
+;; A `fixed32` whose top byte was >= 0x80 came back NEGATIVE on ClojureScript
+;; for the same reason (`(bit-shift-left 0xFF 24)` is -16777216 there).
+
+(def ^:private two-pow-32 4294967296)
+
 (defn- encode-fixed [n width]
-  (mapv #(bit-and (bit-shift-right (long n) (* 8 %)) 0xFF) (range width)))
+  (let [v (cond
+            ;; A negative sfixed32 is its two's-complement pattern, and 2^32
+            ;; is exact on both hosts, so this one is representable.
+            (and (neg? n) (= width 4)) (+ n two-pow-32)
+            ;; A negative sfixed64 is not: the pattern is 2^64 - |n|, which no
+            ;; double holds. Refused rather than half-supported, exactly as
+            ;; `encode-varint` refuses negatives.
+            (neg? n)
+            (throw (ex-info "negative sfixed64 is not supported; the two's-complement pattern is past the exactly-representable range"
+                            {:value n}))
+            :else n)]
+    (when (> v max-exact)
+      (throw (ex-info "fixed field exceeds the exactly-representable integer range"
+                      {:value n :width width :max-exact max-exact})))
+    (loop [v v k 0 out []]
+      (if (= k width)
+        out
+        (recur (quot v 256) (inc k) (conj out (mod v 256)))))))
 
 (defn- decode-fixed [bs i width]
-  [(reduce (fn [acc k] (+ acc (bit-shift-left (bit-and (nth bs (+ i k)) 0xFF) (* 8 k))))
-           0 (range width))
+  [(loop [k 0 acc 0 mult 1]
+     (if (= k width)
+       acc
+       (let [acc' (+ acc (* mult (bit-and (nth bs (+ i k)) 0xFF)))]
+         (when (> acc' max-exact)
+           (throw (ex-info "fixed field exceeds the exactly-representable integer range"
+                           {:at i :width width :max-exact max-exact})))
+         ;; `mult` stops growing once it is past anything `acc` may hold. Left
+         ;; to multiply freely it reaches 256^8 = 2^64 on the eighth byte and
+         ;; throws `long overflow` on the JVM -- while ClojureScript, whose
+         ;; doubles do not overflow, sails past. Measured: this is the same
+         ;; hazard `proto.wire/read-varint` documents for its shift, met a
+         ;; second time in a second implementation of the same format.
+         ;; Capping is safe: at that point `mult` already exceeds `max-exact`,
+         ;; so any nonzero byte there trips the guard above regardless.
+         (recur (inc k) acc' (if (> mult max-exact) mult (* mult 256))))))
    (+ i width)])
 
 ;; ── strings ───────────────────────────────────────────────────────────────
