@@ -38,7 +38,7 @@
   or default-valued optional field. Determinism is not aesthetic here — a
   signature is over bytes, and \"the same message\" has to mean the same
   octets on every host and every run."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 ;; ── wire types (protobuf.dev, Encoding §Message Structure) ────────────────
 
