@@ -17,7 +17,7 @@
   A gate that runs one runtime for a library that ships to the other is the
   shape ADR-2608136000 calls a check that cannot answer the question.
 
-      npx nbb --classpath src:test test/run.cljs"
+      npx nbb --classpath src:test test/run.cljk"
   (:require [cljs.test :as t]
             [protobuf.wire-test]))
 
