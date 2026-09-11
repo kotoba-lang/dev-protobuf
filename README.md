@@ -105,7 +105,7 @@ itself.
 
 ```
 clojure -M:test                                    # JVM
-npx nbb --classpath src:test test/run.cljs         # ClojureScript
+npx nbb --classpath src:test test/run.cljk         # ClojureScript
 ```
 
 18 tests / 66 assertions, identical on both, including the spec's own varint
