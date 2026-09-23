@@ -1,5 +1,5 @@
 (ns protobuf.wire-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [protobuf.wire :as pb]))
 
 ;; ── varint, against the values protobuf.dev's Encoding page spells out ────
